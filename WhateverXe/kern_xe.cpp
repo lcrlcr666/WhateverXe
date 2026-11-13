@@ -17587,12 +17587,64 @@ void XE::wrapTGLModeTiming(void *controller,void *fb,void *timing) {
  IORegistryEntry::getRegistryRoot()->setProperty("TGLPanelDepthLast",record,sizeof(record));
 }
 
+
+// -wex-force-rgb8: strip the sink's YCbCr 4:4:4/4:2:2 and deep-colour claims from
+// the EDID handed to the donor, keeping the link at RGB 8 bpc (issue #74).
+//
+// On Raptor Lake-S (for example 8086:A782, Display::XeD) the display13 frontend is
+// not admitted, so the display13 DDC wrappers never install and an EDID patch
+// placed there never runs. The XeD/TGL donor still reads EDID through
+// AppleIntelPort::getDDCBlock, which is wrapTGLPortDDC, so sanitising here is what
+// actually reaches the donor on those parts. Verified on 8086:A782 / Sequoia 15.4:
+// text regains its sharpness and the colour speckle disappears.
+static bool edidForceRgb8(uint8_t *edid, uint32_t block) {
+    static const uint8_t header[] = {0, 255, 255, 255, 255, 255, 255, 0};
+    if (!edid) return false;
+    if (block == 1) {
+        // Only the base block carries the EDID header; the extension starts with 02 03.
+        if (__builtin_memcmp(edid, header, sizeof(header))) return false;
+        // Feature byte 0x18 bits 4:3 are the display type in EDID 1.3 and the
+        // supported colour encodings in 1.4. Keep RGB only either way.
+        edid[0x18] = uint8_t(edid[0x18] & ~0x18U);
+        uint8_t sum = 0;
+        for (unsigned i = 0; i < 127; ++i) sum += edid[i];
+        edid[127] = uint8_t(0x100 - sum);
+        return true;
+    }
+    if (block != 2 || edid[0] != 0x02 || edid[1] < 3) return false;
+    // CTA-861 byte 3 bits 5:4 advertise YCbCr 4:4:4 / 4:2:2.
+    edid[3] = uint8_t(edid[3] & ~0x30U);
+    const unsigned end = (edid[2] > 4 && edid[2] < 128) ? edid[2] : 4;
+    for (unsigned off = 4; off + 1 < end;) {
+        const uint8_t tag = uint8_t(edid[off] >> 5), len = uint8_t(edid[off] & 0x1f);
+        if (!len) break;
+        // HDMI VSDB: drop DC_30bit / DC_36bit / DC_Y444.
+        if (tag == 3 && len >= 7 && edid[off+1] == 0x03 && edid[off+2] == 0x0c && edid[off+3] == 0x00)
+            edid[off+6] = uint8_t(edid[off+6] & 0x80);
+        // HDMI Forum VSDB: keep the link inside HDMI 1.4 rates.
+        if (tag == 3 && len >= 5 && edid[off+1] == 0xd8 && edid[off+2] == 0x5d && edid[off+3] == 0xc4)
+            if (edid[off+5] > 0x44) edid[off+5] = 0x44;
+        // Colorimetry: drop the xvYCC wide-gamut claims.
+        if (tag == 7 && len >= 2 && edid[off+1] == 0x05) edid[off+2] = 0;
+        off += len + 1;
+    }
+    uint8_t sum = 0;
+    for (unsigned i = 0; i < 127; ++i) sum += edid[i];
+    edid[127] = uint8_t(0x100 - sum);
+    return true;
+}
+
 uint32_t XE::wrapTGLPortDDC(void *port, uint32_t block, uint8_t *data, bool force) {
 	auto cfg = *reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(port) + 0x548);
 	auto id = cfg ? cfg[0] : 9;
 	tglTrace(1, id, false, block, force, 0, 0);
 	const auto r = FunctionCast(wrapTGLPortDDC, callbackXE->orgTGLPortDDC)(port, block, data, force);
 	tglTrace(1, id, true, block, force, r, 0);
+	// -wex-force-rgb8: sanitise the EDID before cachePanelDepth and the exposed
+	// TGLWEGPort*DDC* copies, so the donor only ever sees an RGB 8 bpc sink.
+	if (r == 0 && data && (block == 1 || block == 2) && checkKernelArgument("-wex-force-rgb8") &&
+		edidForceRgb8(data, block))
+		IORegistryEntry::getRegistryRoot()->setProperty("N97FBRgb8Forced", true);
 	cachePanelDepth(port,block,data,r);
 	if (r == 0 && data && (block == 1 || block == 2)) {
 		char key[40]; snprintf(key, sizeof(key), "TGLWEGPort%uDDC%s", id, block == 1 ? "Base" : "Extension");
